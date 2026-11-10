@@ -4,6 +4,10 @@
 
 > Want to know if this tool does anything or is just a placebo? Read [this excellent article](https://batteryuniversity.com/article/bu-808-how-to-prolong-lithium-based-batteries). TL;DR: keep your battery cool, keep it at 80% when plugged in, and discharge it as shallowly as feasible.
 
+### macOS 27 status
+
+On macOS 27 the SMC charge-control keys this tool relies on (`CH0B`, `CH0C`, `CHTE`) are not present (verified on an M3 Max running macOS 27.2). Charge limiting therefore cannot work there, and the CLI now says so and exits with an error instead of silently pretending to maintain a level. macOS's built-in **Charge Limit** (**System Settings → Battery**) is the supported mechanism on those machines. Upstream issues [#474](https://github.com/actuallymentor/battery/issues/474) and [#477](https://github.com/actuallymentor/battery/issues/477) track this.
+
 ### Requirements
 
 This is an app for Apple Silicon Macs. It will not work on Intel macs. Do you have an older Mac? Consider the free version of the [Al Dente](https://apphousekitchen.com/) software package. It is a good alternative and has a premium version with many more features.
