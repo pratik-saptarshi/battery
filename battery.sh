@@ -4,7 +4,7 @@
 ## Update management
 ## variables are used by this binary as well at the update script
 ## ###############
-BATTERY_CLI_VERSION="v1.3.4"
+BATTERY_CLI_VERSION="v1.3.5"
 
 # If a script may run as root:
 #   - Reset PATH to safe defaults at the very beginning of the script.
@@ -26,6 +26,7 @@ maintain_percentage_tracker_file=$configfolder/maintain.percentage
 maintain_voltage_tracker_file=$configfolder/maintain.voltage
 daemon_path=$HOME/Library/LaunchAgents/battery.plist
 calibrate_pidfile=$configfolder/calibrate.pid
+unsupported_notified=$configfolder/unsupported_notified
 path_configfile=/etc/paths.d/50-battery
 
 # Voltage limits
@@ -241,8 +242,31 @@ function smc_write_hex() {
 ## #########################
 ## Detect supported SMC keys
 ## #########################
-[[ $($smc_binary -k CHTE -r) =~ "no data" ]] && smc_supports_tahoe=false || smc_supports_tahoe=true;
-[[ $($smc_binary -k CH0B -r) =~ "no data" ]] && smc_supports_legacy=false || smc_supports_legacy=true;
+# Each charge-control key is classified tri-state: "present" only when the read returned
+# data ("bytes"), "absent" only when smc answered "no data", "unknown" otherwise (for
+# instance "Error: SMCReadKey()"). smc_supports_* is true only for "present", so an
+# unreadable key is never treated as usable.
+function smc_key_state() {
+	local out
+	out=$($smc_binary -k "$1" -r 2>&1)
+	if [[ $out =~ "bytes" ]]; then
+		echo "present"
+	elif [[ $out =~ "no data" ]]; then
+		echo "absent"
+	else
+		echo "unknown"
+	fi
+}
+function smc_key_usable() { [[ "$1" == "present" ]] && echo true || echo false; }
+state_CHTE=$(smc_key_state CHTE)
+smc_supports_tahoe=$(smc_key_usable "$state_CHTE")
+state_CH0B=$(smc_key_state CH0B)
+state_CH0C=$(smc_key_state CH0C)
+# Both legacy keys are written, so either one being readable means the pair can actuate.
+smc_supports_legacy=false
+if [[ "$state_CH0B" == "present" || "$state_CH0C" == "present" ]]; then
+	smc_supports_legacy=true
+fi
 [[ $($smc_binary -k CHIE -r) =~ "no data" ]] && smc_supports_adapter_chie=false || smc_supports_adapter_chie=true;
 [[ $($smc_binary -k CH0I -r) =~ "no data" ]] && smc_supports_adapter_ch0i=false || smc_supports_adapter_ch0i=true;
 [[ $($smc_binary -k CH0J -r) =~ "no data" || $($smc_binary -k CH0J -r) =~ "Error" ]] && smc_supports_adapter_ch0j=false || smc_supports_adapter_ch0j=true;
@@ -370,17 +394,40 @@ function disable_charging() {
 	fi
 }
 
-function get_smc_charging_status() {
-	local status_key="CH0B"
+# Which SMC key can stop charging on this Mac: chte, ch0b/ch0c, none or unknown
+function get_charge_actuator() {
 	if [[ "$smc_supports_tahoe" == "true" ]]; then
+		echo "chte"
+	elif [[ "$smc_supports_legacy" == "true" ]]; then
+		echo "ch0b/ch0c"
+	elif [[ "$state_CHTE $state_CH0B $state_CH0C" =~ "unknown" ]]; then
+		echo "unknown"
+	else
+		echo "none"
+	fi
+}
+
+function get_smc_charging_status() {
+	local actuator status_key hex_status
+	actuator=$(get_charge_actuator)
+	# No charge-control key at all: we cannot know the state, and must not claim "enabled"
+	if [[ "$actuator" == "none" ]]; then
+		echo "unknown"
+		return
+	fi
+	status_key="CH0B"
+	if [[ "$actuator" == "chte" ]]; then
 		status_key="CHTE"
 	fi
 	hex_status=$(smc_read_hex "$status_key")
+	if [[ -z "$hex_status" && "$actuator" == "ch0b/ch0c" && "$state_CH0C" == "present" ]]; then
+		hex_status=$(smc_read_hex CH0C)
+	fi
 	if [[ -z "$hex_status" ]]; then
 		echo "unknown"
 		return
 	fi
-	if [[ "$smc_supports_tahoe" == "true" ]]; then
+	if [[ "$actuator" == "chte" ]]; then
 		if [[ "$hex_status" == "00000000" ]]; then
 			echo "enabled"
 		else
@@ -391,6 +438,59 @@ function get_smc_charging_status() {
 	else
 		echo "disabled"
 	fi
+}
+
+function reprobe_charge_keys() {
+	state_CHTE=$(smc_key_state CHTE)
+	smc_supports_tahoe=$(smc_key_usable "$state_CHTE")
+	state_CH0B=$(smc_key_state CH0B)
+	state_CH0C=$(smc_key_state CH0C)
+	smc_supports_legacy=false
+	if [[ "$state_CH0B" == "present" || "$state_CH0C" == "present" ]]; then
+		smc_supports_legacy=true
+	fi
+}
+
+# Best-effort, read-only: the charge limit macOS itself enforces, e.g. "80% (manualChargeLimit)".
+# Prints nothing if `pmset -g battlimit` is unavailable or its format is not recognised.
+function get_native_charge_limit() {
+	local out soc reason
+	out=$(pmset -g battlimit 2>/dev/null)
+	soc=$(echo "$out" | sed -n -E 's/^[[:space:]]*chargeSocLimitSoc[[:space:]]*=[[:space:]]*([0-9]+);.*/\1/p' | head -n 1)
+	reason=$(echo "$out" | sed -n -E 's/^[[:space:]]*chargeSocLimitReason[[:space:]]*=[[:space:]]*([A-Za-z0-9_]+);.*/\1/p' | head -n 1)
+	if [[ $soc =~ ^[0-9]+$ ]] && [[ -n $reason ]]; then
+		echo "${soc}% ($reason)"
+	fi
+}
+
+# Refuse to run a charge limiter that has nothing to actuate (macOS 27 removed
+# CH0B/CH0C/CHTE). Returns 1 after logging (and notifying at most once) if unsupported.
+function require_charge_actuator() {
+	local charge_actuator native_limit
+	charge_actuator=$(get_charge_actuator)
+	if [[ "$charge_actuator" == "unknown" ]]; then
+		log "SMC charge-control keys could not be read, retrying in 2 seconds"
+		sleep 2
+		reprobe_charge_keys
+		charge_actuator=$(get_charge_actuator)
+		if [[ "$charge_actuator" == "unknown" ]]; then
+			log "SMC charge-control keys still unreadable, treating this Mac as unsupported"
+			charge_actuator="none"
+		fi
+	fi
+	if [[ "$charge_actuator" == "none" ]]; then
+		log "❌ charge limiting unsupported on this Mac/macOS: no CH0B/CH0C/CHTE key"
+		native_limit=$(get_native_charge_limit)
+		if [[ -n "$native_limit" ]]; then
+			log "macOS charge limit active: $native_limit"
+		fi
+		if ! test -f "$unsupported_notified"; then
+			touch "$unsupported_notified"
+			osascript -e 'display notification "Charge limiting is not supported on this Mac/macOS (no CH0B/CH0C/CHTE key). Use System Settings > Battery > Charge Limit instead." with title "Battery"'
+		fi
+		return 1
+	fi
+	return 0
 }
 
 function get_smc_discharging_status() {
@@ -880,6 +980,9 @@ fi
 # Maintain at level
 if [[ "$action" == "maintain_synchronous" ]]; then
 
+	# Never run a limiter loop that cannot actuate anything; exit non-zero instead
+	require_charge_actuator || exit 1
+
 	log_smc_capabilities
 
 	# Checking if the calibration process is running
@@ -981,6 +1084,9 @@ fi
 # Maintain at voltage
 if [[ "$action" == "maintain_voltage_synchronous" ]]; then
 
+	# Never run a limiter loop that cannot actuate anything; exit non-zero instead
+	require_charge_actuator || exit 1
+
 	log_smc_capabilities
 
 	# Recover old maintain status if old setting is found
@@ -1032,6 +1138,12 @@ fi
 if [[ "$action" == "maintain" ]]; then
 
 	assert_not_running_as_root
+
+	# Refuse before touching any running process, config or daemon if nothing can be
+	# actuated. `maintain stop` is exempt: stopping must always work.
+	if [[ "$setting" != "stop" ]]; then
+		require_charge_actuator || exit 1
+	fi
 
 	disable_discharging
 
@@ -1179,7 +1291,14 @@ fi
 if [[ "$action" == "status" ]]; then
 
 	log "Battery at $(get_battery_percentage)% ($(get_remaining_time) remaining), $(get_voltage)V, smc charging $(get_smc_charging_status)"
-	if test -f $pidfile; then
+	if [[ "$(get_charge_actuator)" == "none" ]]; then
+		# There is no key to actuate: never claim the battery is being maintained
+		log "NOT LIMITING (no charge-control key)"
+		native_limit=$(get_native_charge_limit)
+		if [[ -n "$native_limit" ]]; then
+			log "macOS charge limit active: $native_limit"
+		fi
+	elif test -f $pidfile; then
 		maintain_percentage=$(cat $maintain_percentage_tracker_file 2>/dev/null)
 		if [[ $maintain_percentage ]]; then
 			if valid_percentage_range "$maintain_percentage"; then

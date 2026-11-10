@@ -78,44 +78,134 @@ test_harness_version_runs_in_temp_home() {
 	bt_teardown
 }
 
-# ------------------------------------- bug reproduction on the macOS 27 fixture
-# These tests describe the CURRENT (unfixed) behaviour: they must pass before the
-# capability gate is implemented. tests/BASELINE.txt records the same observations.
-test_bug_maintain_starts_daemon_without_charge_key() {
+# --------------------------------------------- C1: fail-loud capability gate
+test_maintain_refused_without_actuator_macos27() {
 	bt_setup smc_macos27.txt ioreg.txt
 	bt_run 30 maintain 74
-	check "bug: maintain 74 returns 0 despite having no charge-control key" [ "$BT_RC" -eq 0 ]
-	check "bug: a LaunchAgent was created" [ -f "$T/home/Library/LaunchAgents/battery.plist" ]
-	check "bug: a pid file was written" [ -s "$T/home/.battery/battery.pid" ]
-	check "bug: the maintain percentage was stored" grep -qx '74' "$T/home/.battery/maintain.percentage"
-	bt_stop_daemons
+	check "maintain 74 exits non-zero on the 27 fixture" [ "$BT_RC" -ne 0 ]
+	check "maintain 74 says charge limiting is unsupported" grep -q 'charge limiting unsupported on this Mac/macOS: no CH0B/CH0C/CHTE key' <<<"$BT_OUT"
+	check "maintain 74 reports the native macOS limit" grep -q 'macOS charge limit active: 80% (manualChargeLimit)' <<<"$BT_OUT"
+	check "maintain 74 wrote nothing to the SMC" [ ! -s "$T/smc_writes.log" ]
+	check "maintain 74 created no LaunchAgent" [ ! -e "$T/home/Library/LaunchAgents/battery.plist" ]
+	check "maintain 74 wrote no pid file" [ ! -e "$T/home/.battery/battery.pid" ]
+	check "maintain 74 stored no percentage" [ ! -e "$T/home/.battery/maintain.percentage" ]
+	check "maintain 74 stored no voltage" [ ! -e "$T/home/.battery/maintain.voltage" ]
+	check "maintain 74 never started a maintenance loop" bash -c "! grep -q 'Starting battery maintenance' <<<\"\$1\"" _ "$BT_OUT"
+	bt_run 30 maintain 74
+	check "a second refusal exits non-zero too" [ "$BT_RC" -ne 0 ]
+	check "the unsupported notification is shown at most once" [ "$(grep -c 'osascript.*not supported' "$T/calls.log")" -le 1 ]
 	bt_teardown
 }
 
-test_bug_loop_claims_charge_at_or_above_without_write() {
+test_maintain_refusal_does_not_kill_running_daemon() {
 	bt_setup smc_macos27.txt ioreg.txt
-	BT_SLEEP_MAX=0.2 bt_start_bg maintain_synchronous 74
-	if bt_wait_for 15 "$T/out" "Charge at or above 74%"; then
-		check "bug: the loop claims 'Charge at or above 74%'" true
-	else
-		not_ok "bug: the loop claims 'Charge at or above 74%'" "output: $(cat "$T/out")"
-	fi
-	check "bug: no charge-control SMC write was attempted" bash -c "! grep -qE '^(CH0B|CH0C|CHTE) ' '$T/smc_writes.log'"
-	check "bug: the loop is still running (no capability gate)" kill -0 "$BT_BG_PID"
-	check "bug: the loop sets the MagSafe LED green anyway" grep -qx 'ACLC -w 03' "$T/smc_writes.log"
+	mkdir -p "$T/home/.battery"
+	bt_dummy
+	echo "$BT_DUMMY_PID active" >"$T/home/.battery/battery.pid"
+	echo "80" >"$T/home/.battery/maintain.percentage"
+	bt_run 30 maintain 74
+	check "maintain 74 on 27 still exits non-zero" [ "$BT_RC" -ne 0 ]
+	check "the already-running daemon pid was NOT killed" kill -0 "$BT_DUMMY_PID"
+	check "the pid file was left untouched" grep -qx "$BT_DUMMY_PID active" "$T/home/.battery/battery.pid"
+	check "the stored percentage was left untouched" [ "$(cat "$T/home/.battery/maintain.percentage")" == "80" ]
+	check "no LaunchAgent was created" [ ! -e "$T/home/Library/LaunchAgents/battery.plist" ]
 	bt_teardown
 }
 
-test_bug_status_claims_maintained_without_charge_key() {
+test_maintain_recover_refused_macos27() {
+	bt_setup smc_macos27.txt ioreg.txt
+	mkdir -p "$T/home/.battery"
+	echo "74" >"$T/home/.battery/maintain.percentage"
+	bt_run 30 maintain recover
+	check "maintain recover exits non-zero on the 27 fixture" [ "$BT_RC" -ne 0 ]
+	check "maintain recover reports the unsupported key" grep -q 'charge limiting unsupported' <<<"$BT_OUT"
+	check "maintain recover created no LaunchAgent" [ ! -e "$T/home/Library/LaunchAgents/battery.plist" ]
+	check "maintain recover did not rewrite the stored percentage" [ "$(cat "$T/home/.battery/maintain.percentage")" == "74" ]
+	bt_teardown
+}
+
+test_maintain_stop_still_works_macos27() {	bt_setup smc_macos27.txt ioreg.txt
+	bt_run 30 maintain stop
+	check "maintain stop exits 0 on the 27 fixture" [ "$BT_RC" -eq 0 ]
+	check "maintain stop still runs the stop path" grep -q 'Killing running maintain daemons' <<<"$BT_OUT"
+	check "maintain stop is not refused by the capability gate" bash -c "! grep -q 'charge limiting unsupported' <<<\"\$1\"" _ "$BT_OUT"
+	bt_teardown
+}
+
+test_maintain_range_and_voltage_refused_macos27() {
+	bt_setup smc_macos27.txt ioreg.txt
+	bt_run 30 maintain 70-80
+	check "maintain 70-80 is refused on 27" [ "$BT_RC" -ne 0 ]
+	check "maintain 70-80 reports the unsupported key" grep -q 'charge limiting unsupported' <<<"$BT_OUT"
+	bt_run 30 maintain 11.4V
+	check "maintain 11.4V is refused on 27" [ "$BT_RC" -ne 0 ]
+	check "maintain 11.4V reports the unsupported key" grep -q 'charge limiting unsupported' <<<"$BT_OUT"
+	check "neither form created a LaunchAgent" [ ! -e "$T/home/Library/LaunchAgents/battery.plist" ]
+	check "neither form wrote to the SMC" [ ! -s "$T/smc_writes.log" ]
+	bt_teardown
+}
+
+test_maintain_synchronous_refuses_without_actuator() {
+	bt_setup smc_macos27.txt ioreg.txt
+	bt_run 15 maintain_synchronous 74
+	check "maintain_synchronous 74 exits non-zero by itself (no loop)" test "$BT_RC" -ne 0 -a "$BT_TIMED_OUT" -eq 0
+	check "maintain_synchronous 74 logs the unsupported message" grep -q 'charge limiting unsupported' <<<"$BT_OUT"
+	check "maintain_synchronous 74 never logs 'Charge at or above'" bash -c "! grep -q 'Charge at or above' <<<\"\$1\"" _ "$BT_OUT"
+	check "maintain_synchronous 74 wrote nothing to the SMC" [ ! -s "$T/smc_writes.log" ]
+	bt_run 15 maintain_synchronous recover
+	check "boot-time maintain_synchronous recover exits non-zero" test "$BT_RC" -ne 0 -a "$BT_TIMED_OUT" -eq 0
+	bt_run 15 maintain_voltage_synchronous 11.4 0.1
+	check "maintain_voltage_synchronous exits non-zero by itself" test "$BT_RC" -ne 0 -a "$BT_TIMED_OUT" -eq 0
+	bt_teardown
+}
+
+test_status_stops_claiming_maintenance_macos27() {
 	bt_setup smc_macos27.txt ioreg.txt
 	mkdir -p "$T/home/.battery"
 	echo "424242 active" >"$T/home/.battery/battery.pid"
 	echo "74" >"$T/home/.battery/maintain.percentage"
 	bt_run 30 status
-	check "bug: status claims the battery is being maintained" grep -q 'currently being maintained at 74%' <<<"$BT_OUT"
+	check "status says NOT LIMITING" grep -q 'NOT LIMITING (no charge-control key)' <<<"$BT_OUT"
+	check "status reports the native macOS limit" grep -q 'macOS charge limit active: 80% (manualChargeLimit)' <<<"$BT_OUT"
+	check "status no longer claims the battery is being maintained" bash -c "! grep -q 'being maintained at' <<<\"\$1\"" _ "$BT_OUT"
 	bt_run 30 status_csv
-	check "status_csv has five comma-separated fields" [ "$(awk -F, '{print NF}' <<<"$BT_OUT")" -eq 5 ]
-	check "status_csv still reports charging as unknown on 27" [ "$(cut -d, -f3 <<<"$BT_OUT")" == "unknown" ]
+	check "status_csv keeps five comma-separated fields" [ "$(awk -F, '{print NF}' <<<"$BT_OUT")" -eq 5 ]
+	check "status_csv charging state is unknown, not enabled" [ "$(cut -d, -f3 <<<"$BT_OUT")" == "unknown" ]
+	bt_teardown
+}
+
+test_maintain_still_works_macos26() {
+	bt_setup smc_macos26.txt ioreg.txt
+	bt_run 30 maintain 74
+	check "maintain 74 exits 0 on the 26 fixture" [ "$BT_RC" -eq 0 ]
+	check "maintain 74 created the LaunchAgent" [ -f "$T/home/Library/LaunchAgents/battery.plist" ]
+	check "maintain 74 stored the percentage" grep -qx '74' "$T/home/.battery/maintain.percentage"
+	check "the loop disables charging via CHTE -w 01000000" bt_wait_for 20 "$T/smc_writes.log" "CHTE -w 01000000"
+	check "no unsupported refusal on the 26 fixture" bash -c "! grep -q 'charge limiting unsupported' <<<\"\$1\"" _ "$BT_OUT"
+	bt_stop_daemons
+	bt_run 30 status
+	check "status does not say NOT LIMITING on the 26 fixture" bash -c "! grep -q 'NOT LIMITING' <<<\"\$1\"" _ "$BT_OUT"
+	bt_teardown
+}
+
+test_legacy_fixture_writes_ch0b_ch0c() {
+	bt_setup smc_legacy.txt ioreg.txt
+	BT_SLEEP_MAX=0.2 bt_start_bg maintain_synchronous 74
+	check "legacy loop disables charging via CH0B -w 02" bt_wait_for 20 "$T/smc_writes.log" "CH0B -w 02"
+	check "legacy loop also writes CH0C -w 02" bt_wait_for 5 "$T/smc_writes.log" "CH0C -w 02"
+	bt_teardown
+}
+
+test_unreadable_key_is_retried_then_refused() {
+	bt_setup smc_macos27.txt ioreg.txt
+	# CHTE answers with an error instead of "no data": must not count as present.
+	sed -i '' 's/^CHTE	.*/CHTE	Error: SMCReadKey() = e00002c1/' "$T/fx/smc.txt"
+	bt_run 30 maintain_synchronous 74
+	check "unknown CHTE: maintain_synchronous exits non-zero by itself" test "$BT_RC" -ne 0 -a "$BT_TIMED_OUT" -eq 0
+	check "unknown CHTE: the probe was retried exactly once" [ "$(grep -c '^read CHTE$' "$T/smc_reads.log")" -eq 2 ]
+	check "unknown CHTE: reported as still unreadable" grep -q 'still unreadable' <<<"$BT_OUT"
+	check "unknown CHTE: treated as unsupported" grep -q 'charge limiting unsupported' <<<"$BT_OUT"
+	check "unknown CHTE: no SMC writes" [ ! -s "$T/smc_writes.log" ]
 	bt_teardown
 }
 
