@@ -1,0 +1,55 @@
+# tests/baseline.sh on UNMODIFIED battery.sh (fix/fail-loud-no-charge-key @ f4e342f, v1.3.4), 2026-11-09
+# Host: macOS 27.2, M3 Max. All runs under tests/harness.sh: temp HOME, rewritten copy of
+# battery.sh, stubbed sudo/smc/pmset/ioreg/launchctl/osascript/curl/kill/sleep/nohup.
+# The SMC, sudo, launchd and the real ~/.battery are never touched.
+# Temp paths and timestamps vary between runs.
+#
+# What this shows on the unfixed CLI: `battery maintain` happily starts a daemon and
+# writes a LaunchAgent/pid/percentage although nothing can stop charging; the loop logs
+# "Charge at or above" and sets the MagSafe LED green with zero charge-control SMC
+# writes; `battery status` claims the battery is being maintained. `maintain stop` still
+# works (rc 0) and logs "Unable to determine SMC keys for enabling charging".
+== B1 maintain 74 on the macOS 27 fixture (no CH0B/CH0C/CHTE key)
+rc=0
+LaunchAgent created: yes
+pid file written: yes
+maintain.percentage: 74
+smc writes: CHIE -w 00;ACLC -w 03;
+daemon log claims 'Charge at or above': 1
+daemon log attempted no charge-control write (it never decides is_charging=enabled)
+
+== B2 maintain_synchronous 74 on the macOS 27 fixture (watch for 3 s)
+log lines claiming 'Charge at or above': 10
+smc writes to CH0B/CH0C/CHTE: 0
+smc writes in total: 10
+last 4 output lines:
+11/09/26-18:06:49 [26686]: setting LED to green
+11/09/26-18:06:49 [26686]: Charge at or above 74%
+11/09/26-18:06:49 [26686]: 💡 Setting magsafe color to green
+11/09/26-18:06:49 [26686]: setting LED to green
+
+== B3 status on the macOS 27 fixture with a stored maintain percentage
+rc=0
+11/09/26-18:06:50 [27107]: Battery at 80% (attached; remaining), 12.457V, smc charging unknown
+11/09/26-18:06:50 [27107]: Your battery is currently being maintained at 74%
+status_csv: 80,attached;,unknown,not discharging,74
+
+== B4 maintain stop on the macOS 27 fixture
+rc=0
+11/09/26-18:06:51 [27260]: ⚠️ Unable to reset charging state
+11/09/26-18:06:51 [27260]: Killing running maintain daemons & enabling charging as default state
+11/09/26-18:06:51 [27260]: ⚠️ Unable to determine SMC keys for enabling charging
+11/09/26-18:06:51 [27260]: ⚠️ Unable to reset charging state
+
+== B5 maintain 74 on the synthetic macOS 26 fixture (CHTE present)
+rc=0
+LaunchAgent created: yes
+smc writes: CHIE -w 00;CHTE -w 01000000;ACLC -w 03;
+
+== B6 maintain_synchronous 74 on the synthetic legacy fixture (CH0B/CH0C present)
+smc writes: CH0B -w 02;CH0C -w 02;ACLC -w 03;
+
+== B7 CHTE answers 'Error:' instead of 'no data'
+loop still running: yes
+CHTE reads: 8
+charge-control writes: 0

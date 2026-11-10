@@ -1,0 +1,9 @@
+# SYNTHETIC: legacy Apple Silicon charge controller (CH0B and CH0C present, CHTE absent).
+# Derived from the real smc_macos27.txt capture with CH0B/CH0C added. Not a real capture.
+CHTE	  CHTE  [    ]  no data
+CH0B	  CH0B  [ui8 ]  0 (bytes 00)
+CH0C	  CH0C  [ui8 ]  0 (bytes 00)
+CH0I	  CH0I  [    ]  no data
+CH0J	Error: SMCReadKey() = e00002c1
+CHIE	  CHIE  [hex_]  (bytes 00)
+ACLC	  ACLC  [ui8 ]  3 (bytes 03)

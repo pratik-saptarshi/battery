@@ -1,0 +1,10 @@
+# Captured read-only on this Mac (M3 Max, macOS 27.2, 26B123) on 2026-11-09 with:
+#   /usr/local/bin/smc -k KEY -r
+# Format: KEY<TAB>verbatim output line. Keys not listed answer "  KEY  [    ]  no data".
+CHTE	  CHTE  [    ]  no data
+CH0B	  CH0B  [    ]  no data
+CH0C	  CH0C  [    ]  no data
+CH0I	  CH0I  [    ]  no data
+CH0J	Error: SMCReadKey() = e00002c1
+CHIE	  CHIE  [hex_]  (bytes 00)
+ACLC	  ACLC  [ui8 ]  3 (bytes 03)
